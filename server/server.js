@@ -1,0 +1,41 @@
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// store code → peerId
+const codeMap = {};
+
+io.on("connection", (socket) => {
+  console.log("User connected");
+
+  socket.on("register-code", ({ code, peerId }) => {
+    codeMap[code] = peerId;
+    console.log("Stored:", code, peerId);
+  });
+
+  socket.on("get-peer", (code, callback) => {
+    const peerId = codeMap[code];
+    callback(peerId || null);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected");
+  });
+});
+
+server.listen(5000, "0.0.0.0", () => {
+  console.log("Server running on port 5000");
+});
