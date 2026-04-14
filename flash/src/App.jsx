@@ -3,7 +3,9 @@ import Peer from "peerjs";
 import { io } from "socket.io-client";
 import { QRCodeCanvas } from "qrcode.react";
 
-const socket = io("https://flash-66bi.onrender.com");
+const socket = io("https://flash-66bi.onrender.com", {
+  transports: ["polling"], // 🔥 force polling instead of websocket
+});
 
 export default function App() {
   const [peer, setPeer] = useState(null);
