@@ -1,1 +1,75 @@
 @import "tailwindcss";
+
+@layer base {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+}
+
+@keyframes slide-in-from-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation-duration: 0.5s;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  animation-fill-mode: both;
+}
+
+.slide-in-from-right {
+  animation-name: slide-in-from-right;
+}
+
+/* Custom QR Scanner Styles */
+#reader {
+  border: none !important;
+}
+
+#reader__dashboard_section_csr button {
+  background-color: #3b82f6 !important;
+  color: white !important;
+  border-radius: 0.75rem !important;
+  padding: 0.5rem 1rem !important;
+  font-weight: bold !important;
+  border: none !important;
+  cursor: pointer !important;
+  margin-top: 1rem !important;
+}
+
+#reader__dashboard_section_csr select {
+  background-color: #1e293b !important;
+  color: white !important;
+  border-radius: 0.5rem !important;
+  padding: 0.25rem 0.5rem !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  margin: 0.5rem 0 !important;
+}
+
+#reader video {
+  border-radius: 1rem !important;
+}
+
+#reader img {
+  display: none !important;
+}
+
+#reader__scan_region {
+  background: transparent !important;
+}
