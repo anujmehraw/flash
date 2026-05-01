@@ -112,9 +112,14 @@ export default function App() {
 
   // 🔥 SEND FILE
   const sendFile = () => {
-    if (!peerReady || !file) return;
+    if (!peerReady || !file || !inputCode) return;
 
     socket.emit("get-peer", inputCode, (remotePeerId) => {
+      if (!remotePeerId) {
+        alert("Peer not found! Make sure the receiver code is correct.");
+        return;
+      }
+
       const conn = peer.connect(remotePeerId);
 
       conn.on("open", async () => {
@@ -149,6 +154,12 @@ export default function App() {
 
     setIsSending(true);
     socket.emit("get-peer", inputCode, (remotePeerId) => {
+      if (!remotePeerId) {
+        alert("Peer not found! Make sure the receiver code is correct.");
+        setIsSending(false);
+        return;
+      }
+
       const conn = peer.connect(remotePeerId);
 
       conn.on("open", () => {

@@ -12,10 +12,11 @@ const allowedOrigins = [
 ];
 
 app.use(cors({
-  origin: allowedOrigins,
+  origin: "*", // Allow all origins for the demo
   methods: ["GET", "POST"],
   credentials: true
 }));
+
 
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");
@@ -26,10 +27,11 @@ const server = http.createServer(app);
 // 🔥 Socket.io with CORS fix
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: "*",
     methods: ["GET", "POST"]
   }
 });
+
 
 // store code → peerId
 const codeMap = {};
