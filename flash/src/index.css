@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
 @layer base {
   .custom-scrollbar::-webkit-scrollbar {
     width: 6px;
@@ -27,6 +35,17 @@
   }
 }
 
+@keyframes slide-in-from-top {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
 .animate-in {
   animation-duration: 0.5s;
   animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
@@ -35,6 +54,10 @@
 
 .slide-in-from-right {
   animation-name: slide-in-from-right;
+}
+
+.slide-in-from-top {
+  animation-name: slide-in-from-top;
 }
 
 /* Custom QR Scanner Styles */

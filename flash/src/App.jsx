@@ -8,6 +8,14 @@ const socket = io("https://flash-66bi.onrender.com", {
   transports: ["polling"], // 🔥 force polling instead of websocket
 });
 
+const log = (...args) => console.log("[Flash]", ...args);
+const logWarn = (...args) => console.warn("[Flash]", ...args);
+const logError = (...args) => console.error("[Flash]", ...args);
+
+socket.on("connect", () => log("Socket connected", socket.id));
+socket.on("disconnect", (reason) => logWarn("Socket disconnected", reason));
+socket.on("connect_error", (err) => logError("Socket connection error", err.message));
+
 export default function App() {
   const [peer, setPeer] = useState(null);
   const [peerReady, setPeerReady] = useState(false);
@@ -21,18 +29,166 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [isSending, setIsSending] = useState(false);
   const [isScanning, setIsScanning] = useState(false); // 🔥 QR Scanner state
+  const [connectionStatus, setConnectionStatus] = useState("idle"); // idle | connecting | connected | failed
+  const [notifications, setNotifications] = useState([]);
   const scannerRef = useRef(null);
-  const appUrl = window.location.origin;
+  const activeConnRef = useRef(null);
+  const notificationTimeoutsRef = useRef(new Map());
+  const appUrl = import.meta.env.VITE_PUBLIC_URL || window.location.origin;
+
+  const dismissNotification = (id) => {
+    setNotifications((prev) => {
+      const notification = prev.find((n) => n.id === id);
+      if (notification?.previewUrl) {
+        URL.revokeObjectURL(notification.previewUrl);
+      }
+      return prev.filter((n) => n.id !== id);
+    });
+
+    const timeout = notificationTimeoutsRef.current.get(id);
+    if (timeout) {
+      clearTimeout(timeout);
+      notificationTimeoutsRef.current.delete(id);
+    }
+  };
+
+  const showNotification = ({ type, title, message, previewUrl, onAction }) => {
+    const id = Date.now() + Math.random();
+    log("Notification", { type, title, message });
+    setNotifications((prev) => [...prev, { id, type, title, message, previewUrl, onAction }]);
+
+    const timeout = setTimeout(() => dismissNotification(id), 6000);
+    notificationTimeoutsRef.current.set(id, timeout);
+  };
+
+  const attachIncomingHandlers = (conn, remoteCode = null) => {
+    activeConnRef.current = conn;
+    setConnectionStatus("connected");
+
+    log("Peer connected", {
+      remotePeerId: conn.peer,
+      remoteCode: remoteCode || "(incoming)",
+      direction: remoteCode ? "outgoing" : "incoming",
+    });
+
+    showNotification({
+      type: "connected",
+      title: "Device Connected",
+      message: remoteCode
+        ? `Linked with peer ${remoteCode}`
+        : "A device connected to you",
+    });
+
+    conn.on("close", () => {
+      log("Peer disconnected", { remotePeerId: conn.peer });
+      setConnectionStatus("idle");
+      activeConnRef.current = null;
+    });
+
+    let chunks = [];
+    let fileMeta = null;
+    let chunkCount = 0;
+
+    conn.on("data", (data) => {
+      if (typeof data === "object" && data.type === "text") {
+        log("Message received", { text: data.message });
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now(),
+            text: data.message,
+            sender: "them",
+            timestamp: new Date().toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          },
+        ]);
+
+        showNotification({
+          type: "message",
+          title: "New Message",
+          message: data.message,
+          onAction: () => setMode("text"),
+        });
+        return;
+      }
+
+      if (typeof data === "object" && data.fileName) {
+        fileMeta = data;
+        chunkCount = 0;
+        log("File transfer started", {
+          fileName: data.fileName,
+          fileType: data.fileType,
+        });
+        return;
+      }
+
+      if (data === "EOF") {
+        const blob = new Blob(chunks, {
+          type: fileMeta?.fileType,
+        });
+
+        blob.name = fileMeta?.fileName;
+        log("File transfer complete", {
+          fileName: fileMeta?.fileName,
+          fileType: fileMeta?.fileType,
+          size: blob.size,
+          chunks: chunkCount,
+        });
+
+        setReceivedFile(blob);
+        setProgress(100);
+        chunks = [];
+
+        const isImage = fileMeta?.fileType?.startsWith("image/");
+        showNotification({
+          type: "file",
+          title: isImage ? "Image Received" : "File Received",
+          message: fileMeta?.fileName || "Unknown file",
+          previewUrl: isImage ? URL.createObjectURL(blob) : null,
+          onAction: () => setMode("file"),
+        });
+        return;
+      }
+
+      chunks.push(data);
+      chunkCount += 1;
+      if (chunkCount === 1 || chunkCount % 50 === 0) {
+        log("Receiving file chunks...", { chunks: chunkCount });
+      }
+      setProgress((prev) => Math.min(prev + 2, 95));
+    });
+  };
 
 
   // 🔥 QR AUTO-FILL
   useEffect(() => {
+    log("App ready", { appUrl });
+
     const params = new URLSearchParams(window.location.search);
     const codeFromQR = params.get("code");
 
     if (codeFromQR) {
+      log("QR code auto-fill from URL", { code: codeFromQR.toUpperCase() });
       setInputCode(codeFromQR.toUpperCase());
     }
+  }, []);
+
+  useEffect(() => {
+    if (!myCode) return;
+    log("Your access key ready", {
+      myCode,
+      qrUrl: `${appUrl}/?code=${myCode}`,
+    });
+  }, [myCode, appUrl]);
+
+  useEffect(() => {
+    return () => {
+      notificationTimeoutsRef.current.forEach((timeout) => clearTimeout(timeout));
+      notificationTimeoutsRef.current.clear();
+    };
   }, []);
 
   useEffect(() => {
@@ -55,95 +211,128 @@ export default function App() {
       const code = Math.random().toString(36).substring(2, 6).toUpperCase();
       setMyCode(code);
 
+      log("PeerJS ready", { peerId: id, code });
       socket.emit("register-code", { code, peerId: id });
+      log("Code registered with server", { code, peerId: id });
     });
+
+    newPeer.on("error", (err) => logError("PeerJS error", err));
 
     // 🔥 RECEIVER
     newPeer.on("connection", (conn) => {
-      let chunks = [];
-      let fileMeta = null;
-
-      conn.on("data", (data) => {
-        // TEXT
-        if (typeof data === "object" && data.type === "text") {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: Date.now(),
-              text: data.message,
-              sender: "them",
-              timestamp: new Date().toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            },
-          ]);
-          return;
-        }
-
-        // FILE META
-        if (typeof data === "object" && data.fileName) {
-          fileMeta = data;
-          return;
-        }
-
-        // FILE END
-        if (data === "EOF") {
-          const blob = new Blob(chunks, {
-            type: fileMeta?.fileType,
-          });
-
-          blob.name = fileMeta?.fileName;
-          setReceivedFile(blob);
-          setProgress(100);
-          chunks = [];
-          return;
-        }
-
-        chunks.push(data);
-
-        // progress
-        setProgress((prev) => Math.min(prev + 2, 95));
-      });
+      log("Incoming connection request", { from: conn.peer });
+      attachIncomingHandlers(conn, null);
     });
 
     setPeer(newPeer);
   }, []);
 
-  // 🔥 SEND FILE
-  const sendFile = () => {
-    if (!peerReady || !file || !inputCode) return;
+  const connectToPeer = () => {
+    if (!peerReady || !inputCode.trim()) return;
+
+    if (activeConnRef.current?.open) {
+      logWarn("Already connected — skipping connect");
+      return;
+    }
+
+    log("Connecting to peer...", { remoteCode: inputCode.trim() });
+    setConnectionStatus("connecting");
 
     socket.emit("get-peer", inputCode, (remotePeerId) => {
       if (!remotePeerId) {
+        logWarn("Peer not found", { remoteCode: inputCode.trim() });
+        setConnectionStatus("failed");
+        alert("Peer not found! Make sure the receiver code is correct.");
+        return;
+      }
+
+      log("Peer found on server", { remoteCode: inputCode.trim(), remotePeerId });
+      const conn = peer.connect(remotePeerId);
+
+      conn.on("open", () => {
+        log("Outgoing connection open", { remoteCode: inputCode.trim(), remotePeerId });
+        attachIncomingHandlers(conn, inputCode.trim());
+      });
+
+      conn.on("error", (err) => {
+        logError("Connection error", err);
+        setConnectionStatus("failed");
+        activeConnRef.current = null;
+      });
+    });
+  };
+
+  const withConnection = (callback, onError) => {
+    if (activeConnRef.current?.open) {
+      log("Reusing active connection");
+      callback(activeConnRef.current);
+      return;
+    }
+
+    log("Opening connection for send...", { remoteCode: inputCode.trim() });
+
+    socket.emit("get-peer", inputCode, (remotePeerId) => {
+      if (!remotePeerId) {
+        logWarn("Peer not found for send", { remoteCode: inputCode.trim() });
+        onError?.();
         alert("Peer not found! Make sure the receiver code is correct.");
         return;
       }
 
       const conn = peer.connect(remotePeerId);
 
-      conn.on("open", async () => {
-        setProgress(0);
+      conn.on("open", () => {
+        log("Connection open for send", { remotePeerId });
+        attachIncomingHandlers(conn, inputCode.trim());
+        callback(conn);
+      });
 
-        conn.send({
-          fileName: file.name,
-          fileType: file.type,
-        });
+      conn.on("error", (err) => {
+        logError("Send connection error", err);
+        setConnectionStatus("failed");
+        activeConnRef.current = null;
+        onError?.();
+      });
+    });
+  };
 
-        const chunkSize = 16 * 1024;
-        const buffer = await file.arrayBuffer();
+  // 🔥 SEND FILE
+  const sendFile = () => {
+    if (!peerReady || !file || !inputCode) return;
 
-        let offset = 0;
+    withConnection(async (conn) => {
+      setProgress(0);
+      log("Sending file...", {
+        fileName: file.name,
+        fileType: file.type,
+        size: file.size,
+      });
 
-        while (offset < buffer.byteLength) {
-          const chunk = buffer.slice(offset, offset + chunkSize);
-          conn.send(chunk);
-          offset += chunkSize;
+      conn.send({
+        fileName: file.name,
+        fileType: file.type,
+      });
 
-          setProgress(Math.floor((offset / buffer.byteLength) * 100));
-        }
+      const chunkSize = 16 * 1024;
+      const buffer = await file.arrayBuffer();
 
-        conn.send("EOF");
+      let offset = 0;
+      let sentChunks = 0;
+
+      while (offset < buffer.byteLength) {
+        const chunk = buffer.slice(offset, offset + chunkSize);
+        conn.send(chunk);
+        offset += chunkSize;
+        sentChunks += 1;
+
+        setProgress(Math.floor((offset / buffer.byteLength) * 100));
+      }
+
+      conn.send("EOF");
+      log("File sent", {
+        fileName: file.name,
+        size: file.size,
+        chunks: sentChunks,
       });
     });
   };
@@ -153,20 +342,17 @@ export default function App() {
     if (!peerReady || !text.trim() || !inputCode) return;
 
     setIsSending(true);
-    socket.emit("get-peer", inputCode, (remotePeerId) => {
-      if (!remotePeerId) {
-        alert("Peer not found! Make sure the receiver code is correct.");
-        setIsSending(false);
-        return;
-      }
 
-      const conn = peer.connect(remotePeerId);
+    withConnection(
+      (conn) => {
+        log("Sending message...", { text: text.trim() });
 
-      conn.on("open", () => {
         conn.send({
           type: "text",
           message: text,
         });
+
+        log("Message sent", { text: text.trim() });
 
         setMessages((prev) => [
           ...prev,
@@ -182,13 +368,9 @@ export default function App() {
         ]);
         setText("");
         setIsSending(false);
-      });
-
-      conn.on("error", (err) => {
-        console.error("Connection error:", err);
-        setIsSending(false);
-      });
-    });
+      },
+      () => setIsSending(false)
+    );
   };
 
   const handleKeyDown = (e) => {
@@ -201,6 +383,8 @@ export default function App() {
   // 🔥 QR SCANNER EFFECT
   useEffect(() => {
     if (isScanning) {
+      log("QR scanner started");
+
       const scanner = new Html5QrcodeScanner("reader", {
         fps: 10,
         qrbox: { width: 250, height: 250 },
@@ -209,22 +393,26 @@ export default function App() {
 
       scanner.render(
         (decodedText) => {
-          // Success: extract code from URL or use raw text
+          log("QR scanned", { decodedText });
+
           try {
             const url = new URL(decodedText);
             const code = url.searchParams.get("code");
             if (code) {
+              log("QR code extracted from URL", { code: code.toUpperCase() });
               setInputCode(code.toUpperCase());
             } else {
+              log("QR raw text used as code", { code: decodedText.toUpperCase().substring(0, 4) });
               setInputCode(decodedText.toUpperCase().substring(0, 4));
             }
           } catch (e) {
+            log("QR parsed as plain code", { code: decodedText.toUpperCase().substring(0, 4) });
             setInputCode(decodedText.toUpperCase().substring(0, 4));
           }
           setIsScanning(false);
           scanner.clear();
         },
-        (error) => {
+        () => {
           // Silent errors during scan
         }
       );
@@ -243,23 +431,23 @@ export default function App() {
         <div className="absolute -bottom-[10%] -right-[10%] w-[40%] h-[40%] bg-emerald-600/10 blur-[120px] rounded-full" />
       </div>
 
-      <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-8 md:px-6">
-        <header className="flex flex-col md:flex-row items-center justify-between gap-6 rounded-[2rem] border border-white/10 bg-white/5 p-8 shadow-2xl backdrop-blur-xl">
-          <div className="flex items-center gap-4">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-emerald-500 shadow-lg shadow-blue-500/20">
-              <span className="text-3xl">⚡</span>
+      <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-5 px-3 py-4 sm:gap-8 sm:px-4 sm:py-8 md:px-6">
+        <header className="flex flex-col items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/5 p-5 shadow-2xl backdrop-blur-xl sm:flex-row sm:gap-6 sm:rounded-[2rem] sm:p-8">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-emerald-500 shadow-lg shadow-blue-500/20 sm:h-14 sm:w-14 sm:rounded-2xl">
+              <span className="text-2xl sm:text-3xl">⚡</span>
             </div>
             <div>
-              <h1 className="text-4xl font-black tracking-tight text-white bg-clip-text">
+              <h1 className="text-2xl font-black tracking-tight text-white sm:text-4xl">
                 Flash
               </h1>
-              <p className="text-sm font-medium text-slate-400">
+              <p className="text-xs font-medium text-slate-400 sm:text-sm">
                 P2P Instant Transfer
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 rounded-2xl bg-white/5 p-2 pr-4 border border-white/5">
+          <div className="flex w-full items-center justify-center gap-3 rounded-xl border border-white/5 bg-white/5 p-2 pr-4 sm:w-auto sm:rounded-2xl">
             <div
               className={`h-3 w-3 rounded-full animate-pulse ${
                 peerReady ? "bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.5)]" : "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.5)]"
@@ -271,11 +459,11 @@ export default function App() {
           </div>
         </header>
 
-        <main className="grid gap-8 lg:grid-cols-12">
+        <main className="grid gap-5 sm:gap-8 lg:grid-cols-12">
           {/* Left Column: Connection Info */}
-          <div className="lg:col-span-4 flex flex-col gap-6">
-            <section className="group rounded-[2rem] border border-white/10 bg-white/5 p-8 shadow-xl backdrop-blur-md transition-all hover:border-white/20">
-              <div className="flex items-center justify-between mb-6">
+          <div className="flex flex-col gap-5 sm:gap-6 lg:col-span-4">
+            <section className="group rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl backdrop-blur-md transition-all hover:border-white/20 sm:rounded-[2rem] sm:p-8">
+              <div className="mb-5 flex items-center justify-between sm:mb-6">
                 <p className="text-xs font-bold uppercase tracking-[0.2em] text-blue-400">
                   Your Access Key
                 </p>
@@ -286,18 +474,18 @@ export default function App() {
                 </div>
               </div>
               
-              <div className="flex flex-col items-center gap-6">
+              <div className="flex flex-col items-center gap-5 sm:gap-6">
                 <div className="relative">
-                  <div className="absolute -inset-4 bg-gradient-to-br from-blue-500/20 to-emerald-500/20 blur-2xl rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
-                  <h2 className="relative text-5xl font-black tracking-[0.2em] text-white">
+                  <div className="absolute -inset-4 rounded-full bg-gradient-to-br from-blue-500/20 to-emerald-500/20 opacity-0 blur-2xl transition-opacity group-hover:opacity-100" />
+                  <h2 className="relative text-4xl font-black tracking-[0.2em] text-white sm:text-5xl">
                     {myCode || "----"}
                   </h2>
                 </div>
 
-                <div className="relative rounded-3xl bg-white p-5 shadow-2xl transition-transform group-hover:scale-[1.02]">
+                <div className="relative scale-90 rounded-3xl bg-white p-4 shadow-2xl transition-transform group-hover:scale-[1.02] sm:scale-100 sm:p-5">
                   <QRCodeCanvas 
                     value={`${appUrl}/?code=${myCode}`} 
-                    size={160} 
+                    size={140} 
                     level="H"
                     includeMargin={false}
                   />
@@ -309,7 +497,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="rounded-[2rem] border border-white/10 bg-white/5 p-8 shadow-xl backdrop-blur-md">
+            <section className="rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl backdrop-blur-md sm:rounded-[2rem] sm:p-8">
               <div className="mb-4 flex items-center justify-between">
                 <label className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-400">
                   Remote Peer Key
@@ -325,14 +513,56 @@ export default function App() {
                   Scan
                 </button>
               </div>
-              <div className="relative">
+              <div className="flex overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-inner transition focus-within:border-blue-500/50 focus-within:ring-4 focus-within:ring-blue-500/30">
                 <input
                   placeholder="Paste receiver code..."
                   value={inputCode}
-                  onChange={(e) => setInputCode(e.target.value.toUpperCase())}
-                  className="w-full rounded-2xl border border-white/10 bg-white/5 px-6 py-4 text-xl font-bold uppercase tracking-widest text-white outline-none ring-blue-500/50 transition focus:border-blue-500/50 focus:ring-4"
+                  onChange={(e) => {
+                    setInputCode(e.target.value.toUpperCase());
+                    if (connectionStatus === "connected") {
+                      setConnectionStatus("idle");
+                      activeConnRef.current = null;
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      connectToPeer();
+                    }
+                  }}
+                  className="min-w-0 flex-1 bg-transparent px-4 py-3.5 text-base font-bold uppercase tracking-widest text-white outline-none placeholder:font-medium placeholder:normal-case placeholder:tracking-normal placeholder:text-slate-500 sm:px-5 sm:py-4 sm:text-lg"
                 />
+                <button
+                  type="button"
+                  onClick={connectToPeer}
+                  disabled={!peerReady || !inputCode.trim() || connectionStatus === "connecting"}
+                  className="flex shrink-0 items-center justify-center gap-1.5 self-stretch border-l border-white/10 bg-emerald-600 px-3.5 text-sm font-black uppercase tracking-wider text-white transition-all hover:bg-emerald-500 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-emerald-600 sm:gap-2 sm:px-5"
+                >
+                  {connectionStatus === "connecting" ? (
+                    <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                  ) : (
+                    <>
+                      <span className="hidden sm:inline">Enter</span>
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                      </svg>
+                    </>
+                  )}
+                </button>
               </div>
+
+              {connectionStatus === "connected" && (
+                <div className="mt-3 flex items-center gap-2 rounded-xl bg-emerald-500/10 px-4 py-2.5 border border-emerald-500/20">
+                  <div className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
+                  <span className="text-sm font-bold text-emerald-400">Connected</span>
+                </div>
+              )}
+
+              {connectionStatus === "failed" && (
+                <div className="mt-3 flex items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-2.5">
+                  <span className="text-xs font-bold text-red-400 sm:text-sm">Connection failed — check the code and try again</span>
+                </div>
+              )}
 
               <div className="mt-6 flex gap-2 rounded-2xl bg-white/5 p-1.5 border border-white/5">
                 <button
@@ -366,19 +596,19 @@ export default function App() {
           </div>
 
           {/* Right Column: Interaction Area */}
-          <div className="lg:col-span-8 flex flex-col gap-6">
-            <section className="flex flex-col h-[600px] rounded-[2rem] border border-white/10 bg-white/5 shadow-2xl backdrop-blur-md overflow-hidden">
+          <div className="flex flex-col gap-5 sm:gap-6 lg:col-span-8">
+            <section className="flex h-[min(520px,calc(100dvh-22rem))] min-h-[360px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-2xl backdrop-blur-md sm:h-[600px] sm:rounded-[2rem]">
               {/* Transfer Mode Content */}
               <div className="flex-1 flex flex-col">
                 {mode === "file" ? (
-                  <div className="flex-1 flex flex-col items-center justify-center p-12 text-center">
-                    <div className="mb-8 flex h-32 w-32 items-center justify-center rounded-[2.5rem] bg-blue-500/10 text-blue-400">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <div className="flex flex-1 flex-col items-center justify-center p-5 text-center sm:p-12">
+                    <div className="mb-6 flex h-24 w-24 items-center justify-center rounded-[2rem] bg-blue-500/10 text-blue-400 sm:mb-8 sm:h-32 sm:w-32 sm:rounded-[2.5rem]">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 sm:h-16 sm:w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                       </svg>
                     </div>
-                    <h3 className="text-2xl font-bold text-white mb-2">Ready for Transfer</h3>
-                    <p className="text-slate-400 mb-8 max-w-sm">Select any file to beam it directly to your connected peer.</p>
+                    <h3 className="mb-2 text-xl font-bold text-white sm:text-2xl">Ready for Transfer</h3>
+                    <p className="mb-6 max-w-sm text-sm text-slate-400 sm:mb-8 sm:text-base">Select any file to beam it directly to your connected peer.</p>
                     
                     <div className="w-full max-w-md space-y-4">
                       <label className="group relative block w-full cursor-pointer">
@@ -387,7 +617,7 @@ export default function App() {
                           onChange={(e) => setFile(e.target.files[0])}
                           className="hidden"
                         />
-                        <div className="flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-white/10 bg-white/5 px-6 py-10 transition-all group-hover:border-blue-500/50 group-hover:bg-blue-500/5">
+                        <div className="flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-white/10 bg-white/5 px-4 py-8 transition-all group-hover:border-blue-500/50 group-hover:bg-blue-500/5 sm:rounded-3xl sm:px-6 sm:py-10">
                           <span className="text-sm font-bold text-slate-300">
                             {file ? file.name : "Choose a file"}
                           </span>
@@ -400,7 +630,7 @@ export default function App() {
                       <button
                         onClick={sendFile}
                         disabled={!peerReady || !file || !inputCode}
-                        className="w-full rounded-2xl bg-blue-600 px-8 py-4 text-lg font-black text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-500 hover:scale-[1.02] active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+                        className="w-full rounded-xl bg-blue-600 px-6 py-3.5 text-base font-black text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-30 sm:rounded-2xl sm:px-8 sm:py-4 sm:text-lg sm:hover:scale-[1.02]"
                       >
                         Beam File
                       </button>
@@ -409,7 +639,7 @@ export default function App() {
                 ) : (
                   <div className="flex-1 flex flex-col h-full overflow-hidden">
                     {/* Chat Messages */}
-                    <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+                    <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar sm:p-6">
                       {messages.length === 0 ? (
                         <div className="flex flex-col items-center justify-center h-full text-slate-500 opacity-50">
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -424,7 +654,7 @@ export default function App() {
                             className={`flex flex-col ${msg.sender === "me" ? "items-end" : "items-start"}`}
                           >
                             <div
-                              className={`max-w-[80%] rounded-2xl px-5 py-3 text-sm font-medium shadow-sm ${
+                              className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm font-medium shadow-sm sm:max-w-[80%] sm:px-5 sm:py-3 ${
                                 msg.sender === "me"
                                   ? "bg-emerald-600 text-white rounded-tr-none"
                                   : "bg-white/10 text-slate-100 rounded-tl-none border border-white/5"
@@ -441,20 +671,20 @@ export default function App() {
                     </div>
 
                     {/* Chat Input */}
-                    <div className="p-6 pt-2 bg-black/20 backdrop-blur-md">
-                      <div className="relative flex items-end gap-3 rounded-[1.5rem] border border-white/10 bg-white/5 p-3 transition-all focus-within:border-emerald-500/50">
+                    <div className="bg-black/20 p-3 backdrop-blur-md sm:p-6 sm:pt-2">
+                      <div className="relative flex items-end gap-2 rounded-2xl border border-white/10 bg-white/5 p-2.5 transition-all focus-within:border-emerald-500/50 sm:gap-3 sm:rounded-[1.5rem] sm:p-3">
                         <textarea
                           placeholder="Type a message..."
                           value={text}
                           onChange={(e) => setText(e.target.value)}
                           onKeyDown={handleKeyDown}
-                          className="flex-1 max-h-32 min-h-[48px] resize-none bg-transparent px-3 py-2 text-sm text-white outline-none custom-scrollbar"
+                          className="flex-1 max-h-28 min-h-[44px] resize-none bg-transparent px-2 py-2 text-base text-white outline-none custom-scrollbar sm:max-h-32 sm:min-h-[48px] sm:px-3 sm:text-sm"
                           rows={1}
                         />
                         <button
                           onClick={sendText}
                           disabled={!peerReady || !text.trim() || !inputCode || isSending}
-                          className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 transition-all hover:bg-emerald-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 transition-all hover:bg-emerald-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 sm:h-11 sm:w-11 sm:rounded-xl"
                         >
                           {isSending ? (
                             <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
@@ -465,9 +695,6 @@ export default function App() {
                           )}
                         </button>
                       </div>
-                      <p className="mt-3 text-center text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                        Press Enter to send • Shift + Enter for new line
-                      </p>
                     </div>
                   </div>
                 )}
@@ -476,11 +703,95 @@ export default function App() {
           </div>
         </main>
 
+        {/* Toast Notifications */}
+        <div className="pointer-events-none fixed inset-x-3 top-3 z-[200] flex flex-col gap-3 sm:inset-x-auto sm:right-6 sm:top-6 sm:w-full sm:max-w-sm">
+          {notifications.map((notification) => (
+            <div
+              key={notification.id}
+              role="alert"
+              className={`pointer-events-auto animate-in slide-in-from-top rounded-2xl border p-4 shadow-2xl backdrop-blur-xl ${
+                notification.type === "message"
+                  ? "border-emerald-500/30 bg-emerald-500/15"
+                  : notification.type === "connected"
+                    ? "border-violet-500/30 bg-violet-500/15"
+                    : "border-blue-500/30 bg-blue-500/15"
+              }`}
+            >
+              <div className="flex items-start gap-3">
+                <div
+                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-white ${
+                    notification.type === "message"
+                      ? "bg-emerald-500"
+                      : notification.type === "connected"
+                        ? "bg-violet-500"
+                        : "bg-blue-500"
+                  }`}
+                >
+                  {notification.type === "message" ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+                    </svg>
+                  ) : notification.type === "connected" ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                    </svg>
+                  ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                  )}
+                </div>
+
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-black uppercase tracking-widest text-slate-300">
+                    {notification.title}
+                  </p>
+                  <p className="mt-1 truncate text-sm font-medium text-white">
+                    {notification.message}
+                  </p>
+
+                  {notification.previewUrl && (
+                    <img
+                      src={notification.previewUrl}
+                      alt="Received preview"
+                      className="mt-3 h-24 w-full rounded-xl border border-white/10 object-cover"
+                    />
+                  )}
+
+                  {notification.onAction && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        notification.onAction();
+                        dismissNotification(notification.id);
+                      }}
+                      className="mt-3 text-xs font-bold text-blue-300 transition hover:text-white"
+                    >
+                      View now →
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => dismissNotification(notification.id)}
+                  className="shrink-0 text-slate-400 transition hover:text-white"
+                  aria-label="Dismiss notification"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
         {/* Progress & Received Overlay */}
         {(progress > 0 || receivedFile) && (
-          <div className="fixed bottom-8 right-8 z-50 flex flex-col gap-4 max-w-sm w-full">
+          <div className="fixed inset-x-3 bottom-3 z-50 flex flex-col gap-3 sm:inset-x-auto sm:bottom-8 sm:right-8 sm:w-full sm:max-w-sm">
             {progress > 0 && progress < 100 && (
-              <section className="rounded-3xl border border-white/10 bg-[#0f172a]/90 p-6 shadow-2xl backdrop-blur-xl animate-in slide-in-from-right">
+              <section className="rounded-2xl border border-white/10 bg-[#0f172a]/90 p-4 shadow-2xl backdrop-blur-xl animate-in slide-in-from-right sm:rounded-3xl sm:p-6">
                 <div className="mb-4 flex items-center justify-between">
                   <span className="text-xs font-black uppercase tracking-widest text-blue-400">Transferring...</span>
                   <span className="text-sm font-bold text-white">{progress}%</span>
@@ -495,7 +806,7 @@ export default function App() {
             )}
 
             {receivedFile && (
-              <section className="rounded-3xl border border-white/10 bg-emerald-500/10 p-6 shadow-2xl backdrop-blur-xl border-emerald-500/20 animate-in slide-in-from-right">
+              <section className="rounded-2xl border border-emerald-500/20 border-white/10 bg-emerald-500/10 p-4 shadow-2xl backdrop-blur-xl animate-in slide-in-from-right sm:rounded-3xl sm:p-6">
                 <div className="flex items-start gap-4">
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500 text-white">
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -526,10 +837,10 @@ export default function App() {
 
         {/* QR Scanner Modal */}
         {isScanning && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-md p-4">
-            <div className="relative w-full max-w-lg rounded-[2rem] border border-white/10 bg-[#0f172a] p-8 shadow-2xl">
-              <div className="mb-6 flex items-center justify-between">
-                <h3 className="text-xl font-black text-white">Scan Peer QR</h3>
+          <div className="fixed inset-0 z-[100] flex items-end justify-center bg-black/90 p-3 backdrop-blur-md sm:items-center sm:p-4">
+            <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#0f172a] p-5 shadow-2xl sm:rounded-[2rem] sm:p-8">
+              <div className="mb-4 flex items-center justify-between sm:mb-6">
+                <h3 className="text-lg font-black text-white sm:text-xl">Scan Peer QR</h3>
                 <button
                   onClick={() => setIsScanning(false)}
                   className="h-10 w-10 rounded-full bg-white/5 flex items-center justify-center text-slate-400 transition hover:bg-white/10 hover:text-white"
